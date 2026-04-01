@@ -34,3 +34,6 @@ token.json
 
 # Output
 gpx_output/
+
+# Release script (local only)
+release.ps1

@@ -22,8 +22,8 @@ On first run, a baseline date is set to **now** — only future activities are s
 
 ```bash
 # Clone and install
-git clone <your-repo-url>
-cd Strava-2-Darawich
+git clone https://github.com/JOHNKIMBLE/strava-2-darawich.git
+cd strava-2-darawich
 pip install -r requirements.txt
 ```
 

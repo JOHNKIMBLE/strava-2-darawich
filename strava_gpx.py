@@ -17,6 +17,8 @@ from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
 
+VERSION = "1.0.0"
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 ENV_FILE = SCRIPT_DIR / ".env"
 CONFIG_FILE = SCRIPT_DIR / "config.json"
@@ -30,6 +32,12 @@ STRAVA_API_BASE = "https://www.strava.com/api/v3"
 
 REDIRECT_PORT = 8089
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/callback"
+
+# Activity types that never have GPS data — skip without hitting the streams API
+NO_GPS_TYPES = {
+    "WeightTraining", "Yoga", "Crossfit", "Elliptical", "StairStepper",
+    "Meditation", "Workout", "Sauna",
+}
 
 
 # ── .env loader (no external deps) ──────────────────────────────────────────
@@ -230,6 +238,34 @@ def get_token(cfg):
     return refresh_token(cfg, token)
 
 
+# ── HTTP helpers ─────────────────────────────────────────────────────────────
+
+def strava_request(method, url, access_token, retries=3, **kwargs):
+    """Make an authenticated Strava API request with retry on 429/5xx."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    for attempt in range(retries):
+        resp = requests.request(method, url, headers=headers, **kwargs)
+
+        if resp.status_code == 429:
+            # Rate limited — check Strava's rate limit reset header or back off
+            wait = int(resp.headers.get("Retry-After", 60))
+            print(f"    Rate limited. Waiting {wait}s...")
+            time.sleep(wait)
+            continue
+
+        if resp.status_code >= 500:
+            wait = 2 ** attempt * 5
+            print(f"    Server error ({resp.status_code}). Retrying in {wait}s...")
+            time.sleep(wait)
+            continue
+
+        return resp
+
+    # Last attempt failed, raise
+    resp.raise_for_status()
+    return resp
+
+
 # ── Strava API ───────────────────────────────────────────────────────────────
 
 def get_activities(access_token, after=None, before=None):
@@ -240,14 +276,15 @@ def get_activities(access_token, after=None, before=None):
 
     while True:
         params = {"page": page, "per_page": per_page}
-        if after:
+        if after is not None:
             params["after"] = int(after)
-        if before:
+        if before is not None:
             params["before"] = int(before)
 
-        resp = requests.get(
+        resp = strava_request(
+            "GET",
             f"{STRAVA_API_BASE}/athlete/activities",
-            headers={"Authorization": f"Bearer {access_token}"},
+            access_token,
             params=params,
         )
         resp.raise_for_status()
@@ -268,9 +305,10 @@ def get_activities(access_token, after=None, before=None):
 def get_activity_streams(access_token, activity_id):
     """Fetch GPS streams for a single activity."""
     keys = "time,latlng,altitude,heartrate,cadence,watts,temp"
-    resp = requests.get(
+    resp = strava_request(
+        "GET",
         f"{STRAVA_API_BASE}/activities/{activity_id}/streams",
-        headers={"Authorization": f"Bearer {access_token}"},
+        access_token,
         params={"keys": keys, "key_type": "time"},
     )
     if resp.status_code == 404:
@@ -372,11 +410,8 @@ def push_to_dawarich(cfg, gpx_files):
         print("Dawarich not configured. Skipping push.")
         return
 
-    url = f"{cfg['dawarich_url']}/api/v1/overland/batches"
-    headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
-
-    # Dawarich accepts GPX via the import endpoint
     import_url = f"{cfg['dawarich_url']}/api/v1/imports"
+    headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
 
     for gpx_path in gpx_files:
         print(f"  Pushing {gpx_path.name}...")
@@ -403,7 +438,7 @@ def sync(cfg, after_timestamp=None):
     fetched_ids = set(state.get("fetched_ids", []))
 
     # Determine time range
-    if after_timestamp:
+    if after_timestamp is not None:
         after = after_timestamp
     elif "last_sync" in state:
         after = state["last_sync"]
@@ -435,6 +470,12 @@ def sync(cfg, after_timestamp=None):
         act_type = activity.get("type", "?")
         date = activity["start_date"][:10]
         print(f"  [{i}/{len(new_activities)}] {date} - {name} ({act_type})")
+
+        # Skip activity types that never have GPS
+        if act_type in NO_GPS_TYPES:
+            print(f"    Skipped ({act_type} — no GPS)")
+            fetched_ids.add(activity["id"])
+            continue
 
         # Skip activities without GPS data
         if not activity.get("start_latlng"):
@@ -472,6 +513,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Strava-2-Dawarich: Pull Strava activities as GPX and push to Dawarich."
     )
+    parser.add_argument("--version", action="version", version=f"strava-2-dawarich {VERSION}")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("setup", help="Configure Strava credentials and Dawarich connection")
@@ -536,7 +578,6 @@ def main():
         return
 
     # No command given
-    parse_args.__wrapped__ = True
     print("Usage: python strava_gpx.py {setup|auth|sync|push}")
     print("Run with --help for details.")
 

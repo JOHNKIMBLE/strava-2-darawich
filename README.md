@@ -42,6 +42,18 @@ python strava_gpx.py setup
 
 Both methods work — `.env` takes priority if both exist.
 
+### Virtual Rides (Zwift, etc.)
+
+Virtual rides report GPS from the virtual world (New Caledonia, London, etc.), which creates huge "teleport" distances in Dawarich between your real location and the virtual one. The script auto-detects virtual activities (`VirtualRide`, `VirtualRun`) and relocates their GPS to your home coordinates — preserving the ride's shape, distance, and sensor data without the teleport.
+
+Home location is resolved automatically in this order:
+
+1. `HOME_LOCATION` in `.env` (e.g. `HOME_LOCATION=41.8781,-87.6298`)
+2. A place named "Home" in your Dawarich instance (via the Places API)
+3. Interactive prompt — the script asks for your city/address, geocodes it, and saves to `.env`
+
+Once set, it's cached in `.env` and never asked again.
+
 Then authorize with Strava:
 
 ```bash

@@ -39,6 +39,9 @@ NO_GPS_TYPES = {
     "Meditation", "Workout", "Sauna",
 }
 
+# Virtual activity types — GPS is from a virtual world, not the real location
+VIRTUAL_TYPES = {"VirtualRide", "VirtualRun"}
+
 
 # ── .env loader (no external deps) ──────────────────────────────────────────
 
@@ -75,6 +78,7 @@ def load_config():
             "client_secret": client_secret,
             "dawarich_url": os.environ.get("DAWARICH_URL", "").rstrip("/"),
             "dawarich_api_key": os.environ.get("DAWARICH_API_KEY", ""),
+            "home_location": os.environ.get("HOME_LOCATION", ""),
         }
 
     # Fall back to config.json
@@ -384,6 +388,82 @@ def build_gpx(activity, streams):
     return ET.tostring(gpx, encoding="unicode", xml_declaration=True)
 
 
+def build_gpx_relocated(activity, streams, home_lat, home_lon):
+    """Build a GPX with all points shifted to the home location.
+
+    Offsets every trackpoint so the ride's first point lands on home coords.
+    Preserves the ride's shape, distance, and all sensor data — just moves it
+    from the virtual world to the real home location.
+    """
+    gpx = ET.Element("gpx", {
+        "version": "1.1",
+        "creator": "Strava-2-Dawarich",
+        "xmlns": "http://www.topografix.com/GPX/1/1",
+        "xmlns:gpxtpx": "http://www.garmin.com/xmlschemas/TrackPointExtension/v1",
+    })
+
+    metadata = ET.SubElement(gpx, "metadata")
+    ET.SubElement(metadata, "name").text = activity.get("name", "Activity")
+    ET.SubElement(metadata, "time").text = activity["start_date"]
+
+    trk = ET.SubElement(gpx, "trk")
+    ET.SubElement(trk, "name").text = activity.get("name", "Activity")
+    ET.SubElement(trk, "type").text = activity.get("type", "Unknown")
+    trkseg = ET.SubElement(trk, "trkseg")
+
+    latlng = streams.get("latlng", [])
+    altitude = streams.get("altitude", [])
+    time_offsets = streams.get("time", [])
+    heartrate = streams.get("heartrate", [])
+    cadence = streams.get("cadence", [])
+    watts = streams.get("watts", [])
+    temp = streams.get("temp", [])
+
+    # Calculate offset from ride's first point to home
+    if latlng:
+        lat_offset = home_lat - latlng[0][0]
+        lon_offset = home_lon - latlng[0][1]
+    else:
+        lat_offset = 0
+        lon_offset = 0
+
+    start_time = datetime.fromisoformat(activity["start_date"].replace("Z", "+00:00"))
+
+    for i, (lat, lon) in enumerate(latlng):
+        trkpt = ET.SubElement(trkseg, "trkpt", {
+            "lat": str(lat + lat_offset),
+            "lon": str(lon + lon_offset),
+        })
+
+        if i < len(altitude):
+            ET.SubElement(trkpt, "ele").text = str(altitude[i])
+
+        if i < len(time_offsets):
+            pt_time = start_time + timedelta(seconds=time_offsets[i])
+            ET.SubElement(trkpt, "time").text = pt_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        has_ext = (
+            (i < len(heartrate)) or
+            (i < len(cadence)) or
+            (i < len(watts)) or
+            (i < len(temp))
+        )
+        if has_ext:
+            extensions = ET.SubElement(trkpt, "extensions")
+            tpx = ET.SubElement(extensions, "gpxtpx:TrackPointExtension")
+            if i < len(heartrate):
+                ET.SubElement(tpx, "gpxtpx:hr").text = str(heartrate[i])
+            if i < len(cadence):
+                ET.SubElement(tpx, "gpxtpx:cad").text = str(cadence[i])
+            if i < len(watts):
+                ET.SubElement(tpx, "gpxtpx:power").text = str(watts[i])
+            if i < len(temp):
+                ET.SubElement(tpx, "gpxtpx:atemp").text = str(temp[i])
+
+    ET.indent(gpx, space="  ")
+    return ET.tostring(gpx, encoding="unicode", xml_declaration=True)
+
+
 def save_gpx(activity, gpx_xml):
     """Save GPX file to output directory. Returns the file path."""
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -400,6 +480,77 @@ def save_gpx(activity, gpx_xml):
         f.write(gpx_xml)
 
     return filepath
+
+
+# ── Dawarich Helpers ───────────────────────────────────────────────────────
+
+def geocode_location(query):
+    """Geocode a location string to (lat, lon) using OpenStreetMap Nominatim."""
+    resp = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": query, "format": "json", "limit": 1},
+        headers={"User-Agent": "Strava-2-Dawarich/1.0"},
+    )
+    if resp.ok and resp.json():
+        result = resp.json()[0]
+        return float(result["lat"]), float(result["lon"])
+    return None
+
+
+def save_home_to_env(lat, lon):
+    """Append HOME_LOCATION to the .env file."""
+    entry = f"\n# Home location for virtual ride anchoring\nHOME_LOCATION={lat},{lon}\n"
+    with open(ENV_FILE, "a") as f:
+        f.write(entry)
+    os.environ["HOME_LOCATION"] = f"{lat},{lon}"
+
+
+def get_home_location(cfg):
+    """Get home coordinates from HOME_LOCATION env var, Dawarich places, or ask the user."""
+    # 1. Explicit env var
+    home = cfg.get("home_location", "")
+    if home:
+        lat, lon = [float(x.strip()) for x in home.split(",")]
+        return lat, lon
+
+    # 2. Dawarich "Home" place
+    if cfg.get("dawarich_url") and cfg.get("dawarich_api_key"):
+        places_url = f"{cfg['dawarich_url']}/api/v1/places"
+        headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
+        try:
+            resp = requests.get(places_url, headers=headers)
+            if resp.ok:
+                for place in resp.json():
+                    if place.get("name", "").lower() == "home":
+                        lat, lon = place["latitude"], place["longitude"]
+                        print(f"  Using Home from Dawarich: {lat}, {lon}")
+                        save_home_to_env(lat, lon)
+                        cfg["home_location"] = f"{lat},{lon}"
+                        return lat, lon
+        except Exception:
+            pass
+
+    # 3. Ask the user
+    print("\n  Virtual ride detected but no home location configured.")
+    print("  Enter your home city/address so virtual rides can be anchored there")
+    print("  (this avoids teleport distance in Dawarich).\n")
+    while True:
+        location = input("  Home location (e.g. 'Chicago, IL'): ").strip()
+        if not location:
+            print("  Skipping virtual rides for now.")
+            return None
+        coords = geocode_location(location)
+        if coords:
+            lat, lon = coords
+            print(f"  Found: {lat}, {lon}")
+            confirm = input("  Save this to .env? [Y/n]: ").strip().lower()
+            if confirm in ("", "y", "yes"):
+                save_home_to_env(lat, lon)
+                cfg["home_location"] = f"{lat},{lon}"
+                print(f"  Saved HOME_LOCATION={lat},{lon} to .env\n")
+                return lat, lon
+        else:
+            print("  Could not find that location. Try again or press Enter to skip.")
 
 
 # ── Dawarich Push ────────────────────────────────────────────────────────────
@@ -475,6 +626,23 @@ def sync(cfg, after_timestamp=None):
         if act_type in NO_GPS_TYPES:
             print(f"    Skipped ({act_type} — no GPS)")
             fetched_ids.add(activity["id"])
+            continue
+
+        # Virtual activities: anchor at home location to avoid teleport distance
+        if act_type in VIRTUAL_TYPES:
+            home = get_home_location(cfg)
+            if not home:
+                print(f"    Skipped ({act_type} — set HOME_LOCATION in .env or mark Home in Dawarich)")
+                fetched_ids.add(activity["id"])
+                continue
+            home_lat, home_lon = home
+            streams = get_activity_streams(access_token, activity["id"])
+            gpx_xml = build_gpx_relocated(activity, streams or {}, home_lat, home_lon)
+            filepath = save_gpx(activity, gpx_xml)
+            gpx_files.append(filepath)
+            fetched_ids.add(activity["id"])
+            print(f"    Saved (virtual → home): {filepath.name}")
+            time.sleep(0.5)
             continue
 
         # Skip activities without GPS data

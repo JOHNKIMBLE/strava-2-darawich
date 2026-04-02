@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"from PIL import Image; print\\(''''Pillow available''''\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python3:*)",
+      "Bash(explorer /select,\"C:\\\\Users\\\\Conno\\\\Downloads\\\\Onboarding Media\\\\Okta Verify\\\\download \\(1\\)_blurred.png\")",
+      "Bash(start \"\" \"C:\\\\Users\\\\Conno\\\\Downloads\\\\Onboarding Media\\\\Okta Verify\")",
+      "WebSearch",
+      "WebFetch(domain:dawarich.app)",
+      "WebFetch(domain:deepwiki.com)"
+    ]
+  }
+}
